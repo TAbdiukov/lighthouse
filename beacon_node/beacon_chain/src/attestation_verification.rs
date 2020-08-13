@@ -52,7 +52,7 @@ use std::borrow::Cow;
 use tree_hash::TreeHash;
 use types::{
     Attestation, BeaconCommittee, CommitteeIndex, Epoch, EthSpec, Hash256, IndexedAttestation,
-    RelativeEpoch, SelectionProof, SignedAggregateAndProof, Slot, SubnetId,
+    RelativeEpoch, SelectionProof, ShufflingId, SignedAggregateAndProof, Slot, SubnetId,
 };
 
 /// Returned when an attestation was not successfully verified. It might not have been verified for
@@ -327,7 +327,7 @@ impl<T: BeaconChainTypes> VerifiedAggregatedAttestation<T> {
         //
         // Attestations must be for a known block. If the block is unknown, we simply drop the
         // attestation and do not delay consideration for later.
-        verify_head_block_is_known(chain, &attestation)?;
+        let shuffling_ids = verify_head_block_is_known(chain, &attestation)?;
 
         // Ensure that the attestation has participants.
         if attestation.aggregation_bits.is_zero() {
@@ -335,7 +335,7 @@ impl<T: BeaconChainTypes> VerifiedAggregatedAttestation<T> {
         }
 
         let indexed_attestation =
-            map_attestation_committee(chain, attestation, |(committee, _)| {
+            map_attestation_committee(chain, attestation, &shuffling_ids, |(committee, _)| {
                 // Note: this clones the signature which is known to be a relatively slow operation.
                 //
                 // Future optimizations should remove this clone.
@@ -433,10 +433,14 @@ impl<T: BeaconChainTypes> VerifiedUnaggregatedAttestation<T> {
 
         // Attestations must be for a known block. If the block is unknown, we simply drop the
         // attestation and do not delay consideration for later.
-        verify_head_block_is_known(chain, &attestation)?;
+        let shuffling_ids = verify_head_block_is_known(chain, &attestation)?;
 
         let (indexed_attestation, committees_per_slot) =
-            obtain_indexed_attestation_and_committees_per_slot(chain, &attestation)?;
+            obtain_indexed_attestation_and_committees_per_slot(
+                chain,
+                &attestation,
+                &shuffling_ids,
+            )?;
 
         let expected_subnet_id = SubnetId::compute_subnet_for_attestation_data::<T::EthSpec>(
             &indexed_attestation.data,
@@ -518,7 +522,8 @@ impl<T: BeaconChainTypes> VerifiedUnaggregatedAttestation<T> {
     }
 }
 
-/// Returns `Ok(())` if the `attestation.data.beacon_block_root` is known to this chain.
+/// Returns `Ok(shuffling_id)` if the `attestation.data.beacon_block_root` is known to this chain.
+/// You can use this `shuffling_id` to read from the shuffling cache.
 ///
 /// The block root may not be known for two reasons:
 ///
@@ -531,18 +536,18 @@ impl<T: BeaconChainTypes> VerifiedUnaggregatedAttestation<T> {
 fn verify_head_block_is_known<T: BeaconChainTypes>(
     chain: &BeaconChain<T>,
     attestation: &Attestation<T::EthSpec>,
-) -> Result<(), Error> {
-    if chain
+) -> Result<BlockShufflingIds, Error> {
+    chain
         .fork_choice
         .read()
-        .contains_block(&attestation.data.beacon_block_root)
-    {
-        Ok(())
-    } else {
-        Err(Error::UnknownHeadBlock {
+        .get_block(&attestation.data.beacon_block_root)
+        .map(|block| BlockShufflingIds {
+            current: block.current_epoch_shuffling_id,
+            next: block.next_epoch_shuffling_id,
+        })
+        .ok_or_else(|| Error::UnknownHeadBlock {
             beacon_block_root: attestation.data.beacon_block_root,
         })
-    }
 }
 
 /// Verify that the `attestation` is within the acceptable gossip propagation range, with reference
@@ -690,17 +695,42 @@ pub fn verify_signed_aggregate_signatures<T: BeaconChainTypes>(
 /// Assists in readability.
 type CommitteesPerSlot = u64;
 
+struct BlockShufflingIds {
+    current: ShufflingId,
+    next: ShufflingId,
+}
+
+impl BlockShufflingIds {
+    fn id_for_epoch(&self, epoch: Epoch) -> ShufflingId {
+        if epoch == self.current.shuffling_epoch {
+            self.current.clone()
+        } else if epoch == self.next.shuffling_epoch {
+            self.next.clone()
+        } else {
+            let mut shuffling_id = self.next.clone();
+            shuffling_id.shuffling_epoch = epoch;
+            shuffling_id
+        }
+    }
+}
+
 /// Returns the `indexed_attestation` and committee count per slot for the `attestation` using the
 /// public keys cached in the `chain`.
-pub fn obtain_indexed_attestation_and_committees_per_slot<T: BeaconChainTypes>(
+fn obtain_indexed_attestation_and_committees_per_slot<T: BeaconChainTypes>(
     chain: &BeaconChain<T>,
     attestation: &Attestation<T::EthSpec>,
+    block_shuffling_ids: &BlockShufflingIds,
 ) -> Result<(IndexedAttestation<T::EthSpec>, CommitteesPerSlot), Error> {
-    map_attestation_committee(chain, attestation, |(committee, committees_per_slot)| {
-        get_indexed_attestation(committee.committee, &attestation)
-            .map(|attestation| (attestation, committees_per_slot))
-            .map_err(|e| BeaconChainError::from(e).into())
-    })
+    map_attestation_committee(
+        chain,
+        attestation,
+        block_shuffling_ids,
+        |(committee, committees_per_slot)| {
+            get_indexed_attestation(committee.committee, &attestation)
+                .map(|attestation| (attestation, committees_per_slot))
+                .map_err(|e| BeaconChainError::from(e).into())
+        },
+    )
 }
 
 /// Runs the `map_fn` with the committee and committee count per slot for the given `attestation`.
@@ -712,9 +742,10 @@ pub fn obtain_indexed_attestation_and_committees_per_slot<T: BeaconChainTypes>(
 ///
 /// If the committee for `attestation` isn't found in the `shuffling_cache`, we will read a state
 /// from disk and then update the `shuffling_cache`.
-pub fn map_attestation_committee<'a, T, F, R>(
+fn map_attestation_committee<'a, T, F, R>(
     chain: &'a BeaconChain<T>,
     attestation: &Attestation<T::EthSpec>,
+    block_shuffling_ids: &BlockShufflingIds,
     map_fn: F,
 ) -> Result<R, Error>
 where
@@ -723,6 +754,7 @@ where
 {
     let attestation_epoch = attestation.data.slot.epoch(T::EthSpec::slots_per_epoch());
     let target = &attestation.data.target;
+    let shuffling_id = block_shuffling_ids.id_for_epoch(target.epoch);
 
     // Attestation target must be for a known block.
     //
@@ -748,7 +780,7 @@ where
 
     metrics::stop_timer(cache_wait_timer);
 
-    if let Some(committee_cache) = shuffling_cache.get(attestation_epoch, target.root) {
+    if let Some(committee_cache) = shuffling_cache.get(&shuffling_id) {
         let committees_per_slot = committee_cache.committees_per_slot();
         committee_cache
             .get_beacon_committee(attestation.data.slot, attestation.data.index)
@@ -811,7 +843,7 @@ where
             .shuffling_cache
             .try_write_for(ATTESTATION_CACHE_LOCK_TIMEOUT)
             .ok_or_else(|| BeaconChainError::AttestationCacheLockTimeout)?
-            .insert(attestation_epoch, target.root, committee_cache);
+            .insert(shuffling_id, committee_cache);
 
         metrics::stop_timer(committee_building_timer);
 
